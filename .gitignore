@@ -1,0 +1,31 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+
+# env
+.env
+.env.local
+*.local
+
+# Node
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+
+# backend local-mode data (vault, tables, keys, fixtures output)
+backend/.data/
+
+# SAM build artifacts
+infrastructure/.aws-sam/
+.aws-sam/
+infrastructure/samconfig.toml
+
+# Python caches (if tooling used)
+__pycache__/
+*.pyc

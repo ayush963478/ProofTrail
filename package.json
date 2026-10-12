@@ -1,0 +1,16 @@
+{
+  "name": "prooftrail",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ProofTrail — verified chain of custody (repo root: one-command dev runner, tests, build)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "setup": "npm install --prefix backend && npm install --prefix frontend && npm install --prefix capture-service",
+    "dev": "node scripts/dev.mjs",
+    "test": "npm test --prefix backend && npm test --prefix capture-service",
+    "build": "npm run build --prefix frontend"
+  }
+}

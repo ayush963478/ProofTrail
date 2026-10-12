@@ -1,0 +1,7 @@
+node_modules/
+npm-debug.log*
+# Puppeteer local Chromium download
+.chromium/
+local-chromium/
+capture-out/
+*.log

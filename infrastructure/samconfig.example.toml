@@ -1,0 +1,24 @@
+# Example SAM config — copy to `samconfig.toml` and adjust, or just run
+# `sam deploy --guided` (it writes samconfig.toml for you).
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "prooftrail"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+image_repositories = []
+
+# Parameters the stack asks for (defaults shown; see template.yaml):
+[default.deploy.parameters.parameter_overrides]
+EnvironmentName = "prooftrail"
+AuthMode = "cognito"
+TsaMode = "rfc3161"
+TsaUrl = "https://freetsa.org/tsr"
+TsaCertUrl = "https://freetsa.org/tsa.crt"
+ServiceToken = "CHANGE-ME-PROOFTRAIL-SERVICE-TOKEN"
+VaultRetentionDays = "30"
+CaptureImageUri = ""
+CaptureSubnets = ""
+CaptureSecurityGroups = ""

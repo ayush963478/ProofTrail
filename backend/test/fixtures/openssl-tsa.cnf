@@ -1,0 +1,18 @@
+[ default ]
+tsa_policy     = 1.2.3.4.1
+default_bits   = 2048
+
+[ tsa ]
+default_bits   = 2048
+digest         = sha256
+prompt         = no
+certificate    = tsa.crt
+private_key    = tsa.key.pem
+new_certs_dir  = .
+certs          = tsa.crt
+policy         = 1.2.3.4.1
+default_policy = 1.2.3.4.1
+digests        = sha256
+serial         = file:./tsa.serial
+default_days   = 365
+signer_digest  = sha256

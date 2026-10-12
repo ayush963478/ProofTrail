@@ -1,0 +1,843 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  ProofTrail — verified chain of custody for digital evidence.
+  HTTP API + Lambda (api/public/sealWorker/anchorScheduler), DynamoDB tables,
+  S3 staging + Object Lock (COMPLIANCE) vault, KMS signing & storage keys,
+  Cognito user pool (TOTP MFA), SQS seal queue + DLQ, EventBridge anchor
+  schedule, ECS Fargate page-capture task, CloudWatch logs, S3 + CloudFront
+  hosting for the built frontend.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prooftrail
+    Description: Stack/resource name prefix (lowercase, no dashes needed).
+
+  AuthMode:
+    Type: String
+    Default: cognito
+    AllowedValues: [cognito, dev]
+    Description: cognito = real user pool; dev = POST /dev/token local JWTs (testing only).
+
+  TsaMode:
+    Type: String
+    Default: rfc3161
+    AllowedValues: [rfc3161, local]
+    Description: rfc3161 = real RFC 3161 TSA (freetsa.org by default).
+
+  TsaUrl:
+    Type: String
+    Default: https://freetsa.org/tsr
+    Description: RFC 3161 TimeStampReq endpoint.
+
+  TsaCertUrl:
+    Type: String
+    Default: https://freetsa.org/tsa.crt
+    Description: Trusted TSA certificate PEM (empty = trust the in-token chain only).
+
+  ServiceToken:
+    Type: String
+    Default: CHANGE-ME-PROOFTRAIL-SERVICE-TOKEN
+    NoEcho: true
+    Description: Shared secret for x-service-token (internal capture callback).
+
+  DevJwtSecret:
+    Type: String
+    Default: CHANGE-ME-dev-jwt-secret
+    NoEcho: true
+    Description: Only used when AuthMode=dev.
+
+  AuditSalt:
+    Type: String
+    Default: CHANGE-ME-audit-salt
+    NoEcho: true
+    Description: Pepper for sha256(ip + salt) audit hashes.
+
+  VaultRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: S3 Object Lock COMPLIANCE retention for sealed originals.
+
+  AnchorExternalUrl:
+    Type: String
+    Default: ''
+    Description: Optional external endpoint that receives published Merkle roots.
+
+  CaptureImageUri:
+    Type: String
+    Default: ''
+    Description: >-
+      ECR image URI for the capture service (build/push capture-service/Dockerfile,
+      see infrastructure/README.md). Empty = capture task not created; POST /captures
+      returns 501 until provided.
+
+  CaptureSubnets:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Fargate task subnet IDs (default VPC subnets are fine).
+
+  CaptureSecurityGroups:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Fargate task security group IDs (needs outbound HTTPS).
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  HasCaptureImage: !Not [!Equals [!Ref CaptureImageUri, '']]
+
+# ---------------------------------------------------------------------------
+# Globals applied to every Lambda
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [x86_64]
+    Tracing: PassThrough
+    Environment:
+      Variables:
+        MODE: aws
+        NODE_ENV: production
+        AUTH_MODE: !Ref AuthMode
+        DEV_JWT_SECRET: !Ref DevJwtSecret
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
+        TSA_MODE: !Ref TsaMode
+        TSA_URL: !Ref TsaUrl
+        TSA_CERT_URL: !Ref TsaCertUrl
+        MAIN_TABLE: !Ref MainTable
+        LEDGER_TABLE: !Ref LedgerTable
+        ANCHOR_TABLE: !Ref AnchorTable
+        AUDIT_TABLE: !Ref AuditTable
+        CAPTURE_TABLE: !Ref CaptureTable
+        STAGING_BUCKET: !Ref StagingBucket
+        VAULT_BUCKET: !Ref VaultBucket
+        VAULT_RETENTION_DAYS: !Sub '${VaultRetentionDays}'
+        KMS_KEY_ID: !Ref SigningKeyAlias
+        SQS_SEAL_QUEUE_URL: !Ref SealQueue
+        CAPTURE_CLUSTER: !Ref CaptureCluster
+        CAPTURE_TASK_DEF: !If [HasCaptureImage, !Ref CaptureTaskDef, '']
+        CAPTURE_SUBNETS: !Join [',', !Ref CaptureSubnets]
+        CAPTURE_SG: !Join [',', !Ref CaptureSecurityGroups]
+        SERVICE_TOKEN: !Ref ServiceToken
+        AUDIT_SALT: !Ref AuditSalt
+        ANCHOR_EXTERNAL_URL: !Ref AnchorExternalUrl
+        PUBLIC_BASE_URL: !Sub 'https://${FrontendDistribution.DomainName}'
+        API_BASE_URL: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+        CORS_ORIGINS: !Sub '["http://localhost:5173","https://${FrontendDistribution.DomainName}"]'
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "responseLength":"$context.responseLength",
+          "integrationError":"$context.integrationErrorMessage"}
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${EnvironmentName}'
+      RetentionInDays: 30
+
+  # Authenticated application routes (docs/API.md "app routes").
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-api'
+      Description: ProofTrail app API (cases, evidence, captures, packages, shares)
+      CodeUri: ../backend/
+      Handler: src/handlers/api.handler
+      Timeout: 60
+      MemorySize: 2048
+      Events:
+        ProxyAny:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        RootAny:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt MainTable.Arn
+                - !Sub '${MainTable.Arn}/index/*'
+                - !GetAtt LedgerTable.Arn
+                - !GetAtt AnchorTable.Arn
+                - !GetAtt AuditTable.Arn
+                - !GetAtt CaptureTable.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:CreateMultipartUpload
+                - s3:UploadPart
+                - s3:CompleteMultipartUpload
+              Resource:
+                - !Sub '${StagingBucket.Arn}/*'
+                - !Sub '${VaultBucket.Arn}/*'
+            - Effect: Allow
+              Action: [s3:ListBucket, s3:ListBucketMultipartUploads]
+              Resource: !GetAtt StagingBucket.Arn
+            - Effect: Allow
+              Action: [kms:Sign, kms:GetPublicKey, kms:DescribeKey]
+              Resource: !GetAtt SigningKey.Arn
+            - Effect: Allow
+              Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+              Resource: !GetAtt StorageKey.Arn
+            - Effect: Allow
+              Action: [ecs:RunTask, ecs:DescribeTasks]
+              Resource:
+                - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${EnvironmentName}-capture:*'
+                - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${EnvironmentName}-capture'
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource:
+                - !GetAtt FargateTaskExecutionRole.Arn
+                - !GetAtt CaptureTaskRole.Arn
+              Condition:
+                StringEquals:
+                  iam:PassedToService: ecs-tasks.amazonaws.com
+            - Effect: Allow
+              Action: [sqs:SendMessage]
+              Resource: !GetAtt SealQueue.Arn
+
+  # Public + dev + internal routes (auth:false route table).
+  PublicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-public'
+      Description: ProofTrail public verification portal API (/meta, /public/*, /dev/token, /internal/*)
+      CodeUri: ../backend/
+      Handler: src/handlers/public.handler
+      Timeout: 60
+      MemorySize: 1024
+      Events:
+        Meta:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /meta, Method: GET}
+        DevToken:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /dev/token, Method: POST}
+        PublicProxy:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/public/{proxy+}', Method: ANY}
+        InternalCaptureComplete:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/internal/captures/{id}/complete', Method: POST}
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource:
+                - !GetAtt MainTable.Arn
+                - !Sub '${MainTable.Arn}/index/*'
+                - !GetAtt LedgerTable.Arn
+                - !GetAtt AnchorTable.Arn
+                - !GetAtt AuditTable.Arn
+                - !GetAtt CaptureTable.Arn
+            - Effect: Allow
+              Action: [s3:GetObject]
+              Resource:
+                - !Sub '${StagingBucket.Arn}/*'
+                - !Sub '${VaultBucket.Arn}/*'
+            - Effect: Allow
+              Action: [kms:GetPublicKey, kms:DescribeKey]
+              Resource: !GetAtt SigningKey.Arn
+
+  # SQS-driven async sealing (aws mode).
+  SealWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-seal-worker'
+      Description: ProofTrail seal pipeline worker (hash → timestamp → sign → ledger → vault)
+      CodeUri: ../backend/
+      Handler: src/handlers/sealWorker.handler
+      Timeout: 120
+      MemorySize: 1024
+      Events:
+        SealQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SealQueue.Arn
+            BatchSize: 5
+            Enabled: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:ConditionCheckItem
+              Resource:
+                - !GetAtt MainTable.Arn
+                - !Sub '${MainTable.Arn}/index/*'
+                - !GetAtt LedgerTable.Arn
+                - !GetAtt AnchorTable.Arn
+                - !GetAtt AuditTable.Arn
+                - !GetAtt CaptureTable.Arn
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource:
+                - !Sub '${StagingBucket.Arn}/*'
+                - !Sub '${VaultBucket.Arn}/*'
+            - Effect: Allow
+              Action: [kms:Sign, kms:GetPublicKey, kms:DescribeKey]
+              Resource: !GetAtt SigningKey.Arn
+            - Effect: Allow
+              Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+              Resource: !GetAtt StorageKey.Arn
+
+  # Scheduled Merkle anchoring (EventBridge, blueprint §3 step 6).
+  AnchorSchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-anchor-scheduler'
+      Description: ProofTrail periodic Merkle-root batch publisher
+      CodeUri: ../backend/
+      Handler: src/handlers/anchorScheduler.handler
+      Timeout: 60
+      MemorySize: 512
+      Events:
+        AnchorSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Enabled: true
+            Description: Publish Merkle roots of new ledger entries (blueprint §3)
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource:
+                - !GetAtt LedgerTable.Arn
+                - !GetAtt AnchorTable.Arn
+                - !GetAtt MainTable.Arn
+
+# ---------------------------------------------------------------------------
+# DynamoDB (docs/DATA-MODEL.md)
+# ---------------------------------------------------------------------------
+  MainTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-main'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+        - {AttributeName: GSI1PK, AttributeType: S}
+        - {AttributeName: GSI1SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: GSI1PK, KeyType: HASH}
+            - {AttributeName: GSI1SK, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  LedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-ledger'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  AnchorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-anchor'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-audit'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+        - {AttributeName: SK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+        - {AttributeName: SK, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  CaptureTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-capture'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: PK, AttributeType: S}
+      KeySchema:
+        - {AttributeName: PK, KeyType: HASH}
+      SSESpecification: {SSEEnabled: true}
+
+# ---------------------------------------------------------------------------
+# Storage (blueprint §4: staging + write-once Object Lock vault)
+# ---------------------------------------------------------------------------
+  StagingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-staging-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      # Required: browsers PUT presigned uploads cross-origin (web app -> S3).
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, HEAD]
+            AllowedOrigins: ['*'] # data access still requires a valid presigned signature
+            ExposeHeaders: [ETag, x-amz-request-id, x-amz-id-2]
+            MaxAge: 3600
+
+  VaultBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-vault-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt StorageKey.Arn
+      VersioningConfiguration: {Status: Enabled}
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          - DefaultRetention:
+              Mode: COMPLIANCE
+              Days: !Ref VaultRetentionDays
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      # Sealed originals may be fetched directly (presigned GET / redirects).
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, HEAD]
+            AllowedOrigins: ['*']
+            ExposeHeaders: [ETag, Content-Disposition, x-amz-request-id]
+            MaxAge: 3600
+
+  StagingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StagingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt StagingBucket.Arn
+              - !Sub '${StagingBucket.Arn}/*'
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+  VaultBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VaultBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt VaultBucket.Arn
+              - !Sub '${VaultBucket.Arn}/*'
+            Condition: {Bool: {aws:SecureTransport: 'false'}}
+
+# ---------------------------------------------------------------------------
+# Keys (blueprint §7: KMS asymmetric signing, keys never exported)
+# ---------------------------------------------------------------------------
+  SigningKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: ProofTrail manifest signing key (ECDSA P-256, SIGN_VERIFY only)
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootAdmin
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'}
+            Action: kms:*
+            Resource: '*'
+
+  SigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-signing'
+      TargetKeyId: !Ref SigningKey
+
+  StorageKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: ProofTrail S3 vault/staging envelope encryption key
+      KeySpec: AES_256
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootAdmin
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'}
+            Action: kms:*
+            Resource: '*'
+
+  StorageKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-storage'
+      TargetKeyId: !Ref StorageKey
+
+# ---------------------------------------------------------------------------
+# Queue + events (blueprint §7: SQS seal pipeline, EventBridge anchoring)
+# ---------------------------------------------------------------------------
+  SealDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-seal-dlq'
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  SealQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-seal'
+      VisibilityTimeout: 300 # > SealWorker timeout (120s)
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SealDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+# ---------------------------------------------------------------------------
+# Auth (blueprint §7: Cognito + software-token MFA)
+# ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${EnvironmentName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - {Name: verified_email, Priority: 1}
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${EnvironmentName}-web'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 12
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+# ---------------------------------------------------------------------------
+# Capture service on ECS Fargate (blueprint §5: containerised Chromium)
+# ---------------------------------------------------------------------------
+  CaptureCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-capture'
+
+  CaptureLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-capture'
+      RetentionInDays: 30
+
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  CaptureTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: capture-artifacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${StagingBucket.Arn}/captures/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt CaptureTable.Arn
+
+  CaptureTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasCaptureImage
+    Properties:
+      Family: !Sub '${EnvironmentName}-capture'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt CaptureTaskRole.Arn
+      ContainerDefinitions:
+        - Name: capture
+          Image: !Ref CaptureImageUri
+          Essential: true
+          Environment:
+            - {Name: MODE, Value: fargate}
+            - {Name: CHROMIUM_NO_SANDBOX, Value: '1'}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CaptureLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: capture
+
+# ---------------------------------------------------------------------------
+# Frontend hosting (S3 + CloudFront, blueprint §5 "static-hosted verification page")
+# ---------------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-web-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${EnvironmentName}-web-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${EnvironmentName} ProofTrail web app'
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: web-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: web-s3
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # SPA: unknown paths (client routes) serve the app shell
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiUrl:
+    Description: Backend HTTP API base URL (set as API_BASE_URL for tools)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  FrontendUrl:
+    Description: CloudFront URL for the built web app + verification portal
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  FrontendBucketName:
+    Description: Sync `frontend/dist/` here (aws s3 sync)
+    Value: !Ref FrontendBucket
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  AuthModeOut:
+    Value: !Ref AuthMode
+  MainTableName:
+    Value: !Ref MainTable
+  LedgerTableName:
+    Value: !Ref LedgerTable
+  AnchorTableName:
+    Value: !Ref AnchorTable
+  AuditTableName:
+    Value: !Ref AuditTable
+  CaptureTableName:
+    Value: !Ref CaptureTable
+  StagingBucketName:
+    Value: !Ref StagingBucket
+  VaultBucketName:
+    Value: !Ref VaultBucket
+  VaultRetentionDaysOut:
+    Value: !Ref VaultRetentionDays
+  SealQueueUrl:
+    Value: !Ref SealQueue
+  SealDeadLetterQueueUrl:
+    Value: !Ref SealDeadLetterQueue
+  SigningKeyId:
+    Description: KMS signing key id (stored as proof.signature.keyId)
+    Value: !GetAtt SigningKey.KeyId
+  CaptureClusterName:
+    Value: !Ref CaptureCluster
+  CaptureTaskDefinition:
+    Condition: HasCaptureImage
+    Value: !Ref CaptureTaskDef

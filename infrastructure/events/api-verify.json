@@ -1,0 +1,34 @@
+{
+  "version": "2.0",
+  "routeKey": "POST /public/verify",
+  "rawPath": "/public/verify",
+  "rawQueryString": "",
+  "headers": {
+    "content-type": "application/json",
+    "origin": "https://d111111abcdef8.cloudfront.net",
+    "user-agent": "Mozilla/5.0",
+    "x-forwarded-for": "198.51.100.7",
+    "x-forwarded-port": "443",
+    "x-forwarded-proto": "https"
+  },
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "api-id",
+    "domainName": "api-id.execute-api.us-east-1.amazonaws.com",
+    "domainPrefix": "api-id",
+    "http": {
+      "method": "POST",
+      "path": "/public/verify",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "198.51.100.7",
+      "userAgent": "Mozilla/5.0"
+    },
+    "requestId": "EiXo4mPLvHcESHA=",
+    "routeKey": "POST /public/verify",
+    "stage": "$default",
+    "time": "06/Oct/2026:10:05:00 +0000",
+    "timeEpoch": 1791309900000
+  },
+  "body": "{\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}",
+  "isBase64Encoded": false
+}

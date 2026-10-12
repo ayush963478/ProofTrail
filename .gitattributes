@@ -1,0 +1,2 @@
+﻿# Test vectors must stay byte-exact (hashes are verified against them).
+*.bin binary
